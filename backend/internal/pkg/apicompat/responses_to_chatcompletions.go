@@ -34,6 +34,7 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 	var contentText string
 	var refusalText string
 	var reasoningText string
+	var reasoningDetails []ChatReasoningDetail
 	var toolCalls []ChatToolCall
 
 	for _, item := range resp.Output {
@@ -58,6 +59,9 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 			})
 		case "reasoning":
 			reasoningText += responsesReasoningText(item)
+			if detail, ok := anthropicThinkingReasoningDetail(item.EncryptedContent, len(reasoningDetails)); ok {
+				reasoningDetails = append(reasoningDetails, detail)
+			}
 		case "web_search_call":
 			// silently consumed — results already incorporated into text output
 		}
@@ -74,6 +78,7 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 	if reasoningText != "" {
 		msg.ReasoningContent = reasoningText
 	}
+	msg.ReasoningDetails = reasoningDetails
 
 	finishReason := responsesStatusToChatFinishReason(resp.Status, resp.IncompleteDetails, toolCalls)
 
@@ -86,6 +91,30 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 	out.Usage = chatUsageFromResponsesUsage(resp.Usage)
 
 	return out
+}
+
+const anthropicReasoningDetailFormat = "anthropic-claude-v1"
+
+// anthropicThinkingReasoningDetail exposes a bridged Anthropic thinking block
+// as a reasoning_details entry so Chat clients can replay it verbatim.
+func anthropicThinkingReasoningDetail(encrypted string, index int) (ChatReasoningDetail, bool) {
+	if !strings.HasPrefix(encrypted, anthropicThinkingEnvelopePrefix) {
+		return ChatReasoningDetail{}, false
+	}
+	block, err := decodeAnthropicThinking(encrypted)
+	if err != nil {
+		return ChatReasoningDetail{}, false
+	}
+	detail := ChatReasoningDetail{Format: anthropicReasoningDetailFormat, Index: index}
+	if block.Type == "thinking" {
+		detail.Type = "reasoning.text"
+		detail.Text = &block.Thinking
+		detail.Signature = block.Signature
+	} else {
+		detail.Type = "reasoning.encrypted"
+		detail.Data = block.Data
+	}
+	return detail, true
 }
 
 func responsesStatusToChatFinishReason(status string, details *ResponsesIncompleteDetails, toolCalls []ChatToolCall) string {
@@ -126,6 +155,7 @@ type ResponsesEventToChatState struct {
 	SawText                bool
 	Finalized              bool        // true after finish chunk has been emitted
 	NextToolCallIndex      int         // next sequential tool_call index to assign
+	NextReasoningIndex     int         // next reasoning_details index to assign
 	OutputIndexToToolIndex map[int]int // Responses output_index → Chat tool_calls index
 	OutputIndexToArguments map[int]string
 	argumentBuffers        map[int]*strings.Builder
@@ -155,6 +185,8 @@ func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEvent
 		return resToChatHandleRefusalDelta(evt, state)
 	case "response.output_item.added":
 		return resToChatHandleOutputItemAdded(evt, state)
+	case "response.output_item.done":
+		return resToChatHandleOutputItemDone(evt, state)
 	case "response.function_call_arguments.delta",
 		// custom/freeform 工具（如新版 apply_patch）的输入增量与 function_call 参数增量同形，
 		// 均按 OutputIndex 累加到对应工具调用。
@@ -282,6 +314,20 @@ func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesE
 			},
 		}},
 	})}
+}
+
+// resToChatHandleOutputItemDone emits a reasoning item only once it is done,
+// because the signature is complete only then.
+func resToChatHandleOutputItemDone(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Item == nil || evt.Item.Type != "reasoning" {
+		return nil
+	}
+	detail, ok := anthropicThinkingReasoningDetail(evt.Item.EncryptedContent, state.NextReasoningIndex)
+	if !ok {
+		return nil
+	}
+	state.NextReasoningIndex++
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{ReasoningDetails: []ChatReasoningDetail{detail}})}
 }
 
 func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
