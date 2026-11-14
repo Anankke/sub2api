@@ -148,6 +148,7 @@ type usageLogRepository struct {
 	createBatchCh       chan usageLogCreateRequest
 	bestEffortBatchOnce sync.Once
 	bestEffortBatchCh   chan usageLogBestEffortRequest
+	bestEffortRetries   *usageLogRetryQueue
 	bestEffortRecent    *gocache.Cache
 	bestEffortRetry     usageLogWriteRetry
 	// bestEffortLost counts the usage_logs rows this process gave up on.

@@ -68,7 +68,7 @@ func usageLogRowCount(t *testing.T, log *service.UsageLog) int {
 }
 
 // A stall that outlasts several attempts and the caller's deadline but not the retry budget only
-// delays the rows; none is lost, and the writer holds a single connection while rows pile up.
+// delays the rows; none is lost, and the writer and the retrier hold one connection each while rows pile up.
 func TestUsageLogBestEffort_StallLongerThanCallerDeadlineOnlyDelaysRow(t *testing.T) {
 	repo := newUsageLogRepositoryWithSQL(testEntClient(t), integrationDB)
 	repo.bestEffortRetry = usageLogWriteRetry{
@@ -102,8 +102,8 @@ func TestUsageLogBestEffort_StallLongerThanCallerDeadlineOnlyDelaysRow(t *testin
 		require.NoError(t, integrationDB.QueryRow(
 			"SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
 		).Scan(&lockWaiters))
-		require.LessOrEqual(t, lockWaiters, 1)
-		sawWaiter = sawWaiter || lockWaiters == 1
+		require.LessOrEqual(t, lockWaiters, 2) // the writer and the retrier hold one connection each
+		sawWaiter = sawWaiter || lockWaiters > 0
 		time.Sleep(50 * time.Millisecond)
 	}
 	require.True(t, sawWaiter)

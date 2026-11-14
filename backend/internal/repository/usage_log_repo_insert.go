@@ -115,7 +115,8 @@ const (
 	usageLogWriteRetryMaxDelay  = 20 * time.Second
 	// A row is retried for at most this long after it was handed to the writer. It has to
 	// outlast multi-minute write stalls (for example a long-held lock or a storage pause);
-	// rows wait in memory meanwhile, and the queue is bounded by usageLogBestEffortBatchQueueCap.
+	// rows wait in memory meanwhile. The retry queue holds at most usageLogBestEffortBatchQueueCap
+	// rows; when it is full the writer stops taking new rows from the queue until it drains.
 	usageLogWriteRetryBudget = 10 * time.Minute
 )
 
@@ -166,6 +167,10 @@ type usageLogBestEffortRequest struct {
 	apiKeyID int64
 	// A failure after deadline is the last one: the row is abandoned and counted as lost.
 	deadline time.Time
+	// attempt is the number of retries scheduled so far and due is when the next one starts; both
+	// are only used while the row waits in the retry queue.
+	attempt  int
+	due      time.Time
 	resultCh chan error
 }
 
@@ -436,6 +441,7 @@ func (r *usageLogRepository) ensureBestEffortBatcher() {
 	r.bestEffortBatchOnce.Do(func() {
 		if r.bestEffortBatchCh == nil {
 			r.bestEffortBatchCh = make(chan usageLogBestEffortRequest, usageLogBestEffortBatchQueueCap)
+			r.bestEffortRetries = newUsageLogRetryQueue()
 			go r.runBestEffortBatcher(r.db)
 		}
 	})
@@ -475,49 +481,58 @@ func (r *usageLogRepository) runCreateBatcher(db *sql.DB) {
 	}
 }
 
-// runBestEffortBatcher is the only executor of best-effort writes and holds one DB connection at a time.
-// Rows that failed with a transient error stay in pending and are retried after a backoff together
-// with the rows that arrived in the queue meanwhile; new rows wait in the queue instead of starting
-// writes of their own.
+// runBestEffortBatcher writes the rows of the queue in batches. Rows that fail with a transient error
+// are handed to the retry queue, which runBestEffortRetrier works off on a per-row backoff schedule
+// with a connection of its own, so a row that keeps failing never delays the rows that arrive later.
 func (r *usageLogRepository) runBestEffortBatcher(db *sql.DB) {
-	var pending []usageLogBestEffortRequest
-	retry := 0
+	retries := r.bestEffortRetries
+	go r.runBestEffortRetrier(db, retries)
+	defer close(retries.done)
 	for {
-		if len(pending) == 0 {
-			retry = 0
-			first, ok := <-r.bestEffortBatchCh
-			if !ok {
-				return
-			}
-			pending = r.collectBestEffortBatch(append(pending, first), usageLogBestEffortBatchWindow)
-		} else {
-			time.Sleep(r.bestEffortRetry.delay(retry))
-			retry++
-			pending = r.collectBestEffortBatch(pending, 0)
+		retries.waitBelow(usageLogBestEffortBatchQueueCap)
+		first, ok := <-r.bestEffortBatchCh
+		if !ok {
+			return
 		}
-		pending = r.flushBestEffortBatch(db, pending)
+		batch := r.collectBestEffortBatch(append(make([]usageLogBestEffortRequest, 0, usageLogBestEffortBatchMaxSize), first))
+		retries.schedule(r.bestEffortRetry, r.flushBestEffortBatch(db, batch))
 	}
 }
 
-// collectBestEffortBatch tops the batch up from the queue to the batch size limit; with window 0 it
-// only takes rows already in the queue.
-func (r *usageLogRepository) collectBestEffortBatch(batch []usageLogBestEffortRequest, window time.Duration) []usageLogBestEffortRequest {
-	if window <= 0 {
-		for len(batch) < usageLogBestEffortBatchMaxSize {
-			select {
-			case req, ok := <-r.bestEffortBatchCh:
-				if !ok {
-					return batch
-				}
-				batch = append(batch, req)
-			default:
-				return batch
-			}
+// runBestEffortRetrier retries the rows of the retry queue as they come due.
+func (r *usageLogRepository) runBestEffortRetrier(db *sql.DB, retries *usageLogRetryQueue) {
+	for {
+		batch, next := retries.takeDue(usageLogBestEffortBatchMaxSize)
+		if len(batch) > 0 {
+			retries.schedule(r.bestEffortRetry, r.flushBestEffortBatch(db, batch))
+			continue
 		}
-		return batch
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if !next.IsZero() {
+			timer = time.NewTimer(time.Until(next))
+			timeout = timer.C
+		}
+		stopped := false
+		select {
+		case <-retries.wake:
+		case <-timeout:
+		case <-retries.done:
+			stopped = true
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if stopped {
+			return
+		}
 	}
+}
 
-	timer := time.NewTimer(window)
+// collectBestEffortBatch tops the batch up from the queue to the batch size limit, waiting at most
+// usageLogBestEffortBatchWindow for more rows.
+func (r *usageLogRepository) collectBestEffortBatch(batch []usageLogBestEffortRequest) []usageLogBestEffortRequest {
+	timer := time.NewTimer(usageLogBestEffortBatchWindow)
 	defer timer.Stop()
 	for len(batch) < usageLogBestEffortBatchMaxSize {
 		select {
@@ -691,12 +706,13 @@ func (r *usageLogRepository) flushBestEffortBatch(db *sql.DB, batch []usageLogBe
 		}
 		return nil
 	}
-	if isTransientUsageLogWriteError(err) {
-		logUsageLogInsertRetry("batch", len(groupOrder), err)
+	if len(groupOrder) == 1 && isTransientUsageLogWriteError(err) {
+		logUsageLogInsertRetry("batch", 1, err)
 		return r.retainBestEffortGroups(groupOrder, err)
 	}
 
-	// A non-transient error usually comes from individual rows: write them one by one to isolate the bad ones.
+	// A failed batch is written one row at a time, as before: the error may come from individual rows
+	// or from the size of the batch, and the other rows must still land.
 	logger.L().With(
 		zap.String("component", "repository.usage_log"),
 		zap.Int("rows", len(groupOrder)),
@@ -710,10 +726,14 @@ func (r *usageLogRepository) flushBestEffortBatch(db *sql.DB, batch []usageLogBe
 		case singleErr == nil:
 			r.completeBestEffortGroup(group, nil)
 		case isTransientUsageLogWriteError(singleErr):
-			// A stall started in the middle of the one-by-one writes: each remaining row would wait out
-			// the full attempt timeout, so back off and retry the rest as a batch.
-			logUsageLogInsertRetry("single", len(groupOrder)-idx, singleErr)
-			return r.retainBestEffortGroups(groupOrder[idx:], singleErr)
+			// Stop at the first transient failure: if the DB is down, every further row would wait out
+			// the full attempt timeout. The rows not tried yet go first in the next round and this row
+			// goes last, so a row that keeps failing does not hold up the others.
+			retry := make([]*usageLogBestEffortGroup, 0, len(groupOrder)-idx)
+			retry = append(retry, groupOrder[idx+1:]...)
+			retry = append(retry, group)
+			logUsageLogInsertRetry("single", len(retry), singleErr)
+			return r.retainBestEffortGroups(retry, singleErr)
 		default:
 			r.abandonBestEffortGroup(group, "permanent_error", singleErr)
 		}
