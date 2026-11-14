@@ -355,7 +355,9 @@ func (s *GatewayService) handleCCBufferedFromAnthropic(
 		finalResp.Model = mappedModel
 	}
 	responsesResp := apicompat.AnthropicToResponsesResponse(finalResp)
-	ccResp := apicompat.ResponsesToChatCompletions(responsesResp, originalModel)
+	ccResp := apicompat.ResponsesToChatCompletionsWithOptions(responsesResp, originalModel, apicompat.ResponsesToChatCompletionsOptions{
+		AnthropicReasoningDetails: isClaude55SignedThinkingModel(mappedModel),
+	})
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -414,6 +416,7 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 	anthState.PreserveThinkingSignatures = isClaude55SignedThinkingModel(mappedModel)
 	ccState := apicompat.NewResponsesEventToChatState()
 	ccState.Model = originalModel
+	ccState.AnthropicReasoningDetails = isClaude55SignedThinkingModel(mappedModel)
 
 	var usage ClaudeUsage
 	var firstTokenMs *int

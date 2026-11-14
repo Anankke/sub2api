@@ -308,32 +308,34 @@ func chatAssistantToResponses(m ChatMessage, replayAnthropicThinking bool) ([]Re
 	return items, nil
 }
 
-// anthropicReasoningDetailsToResponsesItems rebuilds the bridge envelopes that
-// ResponsesToAnthropicRequest decodes back into thinking blocks.
-func anthropicReasoningDetailsToResponsesItems(details []ChatReasoningDetail) []ResponsesInputItem {
+// anthropicReasoningDetailsToResponsesItems turns the anthropic-claude-v1
+// reasoning.encrypted entries this bridge wrote back into the reasoning items
+// that ResponsesToAnthropicRequest decodes into thinking blocks. The field is
+// decoded entry by entry: a value or entry that does not decode is ignored.
+func anthropicReasoningDetailsToResponsesItems(raw json.RawMessage) []ResponsesInputItem {
+	var entries []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil {
+		return nil
+	}
 	var kept []ChatReasoningDetail
-	for _, d := range details {
-		if d.Format == anthropicReasoningDetailFormat {
-			kept = append(kept, d)
+	for _, entry := range entries {
+		var d ChatReasoningDetail
+		if json.Unmarshal(entry, &d) != nil || d.Format != anthropicReasoningDetailFormat || d.Type != "reasoning.encrypted" {
+			continue
 		}
+		if !strings.HasPrefix(d.Data, anthropicThinkingEnvelopePrefix) {
+			continue
+		}
+		if _, err := decodeAnthropicThinking(d.Data); err != nil {
+			continue
+		}
+		kept = append(kept, d)
 	}
 	sort.SliceStable(kept, func(i, j int) bool { return kept[i].Index < kept[j].Index })
 
 	var items []ResponsesInputItem
 	for _, d := range kept {
-		var block AnthropicContentBlock
-		switch {
-		case d.Type == "reasoning.text" && d.Signature != "":
-			block = AnthropicContentBlock{Type: "thinking", Signature: d.Signature}
-			if d.Text != nil {
-				block.Thinking = *d.Text
-			}
-		case d.Type == "reasoning.encrypted" && d.Data != "":
-			block = AnthropicContentBlock{Type: "redacted_thinking", Data: d.Data}
-		default:
-			continue
-		}
-		items = append(items, ResponsesInputItem{Type: "reasoning", EncryptedContent: encodeAnthropicThinking(block)})
+		items = append(items, ResponsesInputItem{Type: "reasoning", EncryptedContent: d.Data})
 	}
 	return items
 }

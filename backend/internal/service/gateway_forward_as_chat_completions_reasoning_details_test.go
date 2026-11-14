@@ -4,7 +4,9 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -78,9 +80,22 @@ var (
 	upstreamRedactedBlock = apicompat.AnthropicContentBlock{Type: "redacted_thinking", Data: "redacted-blob=="}
 )
 
-const (
-	thinkingDetailJSON = `{"type":"reasoning.text","text":"plan the lookup","signature":"sig-part-A/sig-part-B+==","format":"anthropic-claude-v1","index":0}`
-	redactedDetailJSON = `{"type":"reasoning.encrypted","data":"redacted-blob==","format":"anthropic-claude-v1","index":1}`
+// thinkingEnvelope builds the opaque anthropic-thinking-v1 envelope the Responses layer carries.
+func thinkingEnvelope(blockType, thinking, signature, data string) string {
+	payload, _ := json.Marshal(struct {
+		Type      string `json:"type"`
+		Thinking  string `json:"thinking"`
+		Signature string `json:"signature,omitempty"`
+		Data      string `json:"data,omitempty"`
+	}{blockType, thinking, signature, data})
+	return "anthropic-thinking-v1:" + base64.RawStdEncoding.EncodeToString(payload)
+}
+
+var (
+	thinkingDetailJSON = fmt.Sprintf(`{"type":"reasoning.encrypted","data":%q,"format":"anthropic-claude-v1","index":0}`,
+		thinkingEnvelope("thinking", "plan the lookup", "sig-part-A/sig-part-B+==", ""))
+	redactedDetailJSON = fmt.Sprintf(`{"type":"reasoning.encrypted","data":%q,"format":"anthropic-claude-v1","index":1}`,
+		thinkingEnvelope("redacted_thinking", "", "", "redacted-blob=="))
 )
 
 func runThinkingToolTurnBuffered(t *testing.T) []byte {
@@ -128,7 +143,7 @@ func TestHandleCCStreamingFromAnthropic_ReasoningDetails(t *testing.T) {
 		if rd := delta.Get("reasoning_details"); rd.Exists() {
 			require.Len(t, rd.Array(), 1, "one chunk per block")
 			details = append(details, rd.Array()[0].Raw)
-			seq = append(seq, rd.Array()[0].Get("type").String())
+			seq = append(seq, "detail-"+rd.Array()[0].Get("index").String())
 		}
 		if delta.Get("content").Exists() {
 			seq = append(seq, "content")
@@ -149,9 +164,9 @@ func TestHandleCCStreamingFromAnthropic_ReasoningDetails(t *testing.T) {
 		}
 		return -1
 	}
-	require.Less(t, first("reasoning.text"), first("content"), "seq=%v", seq)
-	require.Less(t, first("content"), first("reasoning.encrypted"), "seq=%v", seq)
-	require.Less(t, first("reasoning.encrypted"), first("tool_calls"), "seq=%v", seq)
+	require.Less(t, first("detail-0"), first("content"), "seq=%v", seq)
+	require.Less(t, first("content"), first("detail-1"), "seq=%v", seq)
+	require.Less(t, first("detail-1"), first("tool_calls"), "seq=%v", seq)
 }
 
 // Conversation history shared with an OpenAI-family model must not carry the
@@ -277,4 +292,95 @@ func TestHandleCCBufferedFromAnthropic_ReasoningDetailsFollowMappedModel(t *test
 
 	details := gjson.GetBytes(rec.Body.Bytes(), "choices.0.message.reasoning_details")
 	require.JSONEq(t, "["+thinkingDetailJSON+","+redactedDetailJSON+"]", details.Raw)
+}
+
+// collectChatStreamReasoningDetails returns the reasoning_details entries of a Chat SSE body, in order.
+func collectChatStreamReasoningDetails(body string) []string {
+	var entries []string
+	for _, line := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		for _, d := range gjson.Get(payload, "choices.0.delta.reasoning_details").Array() {
+			entries = append(entries, d.Raw)
+		}
+	}
+	return entries
+}
+
+func replayedAssistantBlocks(t *testing.T, assistantJSON string) []gjson.Result {
+	t.Helper()
+	reqJSON := `{"model":"claude-opus-5-5","messages":[` +
+		`{"role":"user","content":"look it up"},` + assistantJSON + `,` +
+		`{"role":"tool","tool_call_id":"toolu_1","content":"found"}]}`
+	var ccReq apicompat.ChatCompletionsRequest
+	require.NoError(t, json.Unmarshal([]byte(reqJSON), &ccReq))
+	responsesReq, err := apicompat.ChatCompletionsToResponsesWithOptions(&ccReq, apicompat.ChatCompletionsToResponsesOptions{ReplayAnthropicThinking: true})
+	require.NoError(t, err)
+	anthropicReq, err := apicompat.ResponsesToAnthropicRequest(responsesReq)
+	require.NoError(t, err)
+	return gjson.ParseBytes(anthropicReq.Messages[1].Content).Array()
+}
+
+// Response bytes go through tool name reversal on the way out. The signed
+// thinking text must reach the upstream again exactly as the upstream signed it.
+func TestChatReasoningDetails_ReplayedThinkingSurvivesToolNameReversal(t *testing.T) {
+	signedText := "call cc_ses_lookup next"
+	sse := strings.ReplaceAll(thinkingToolTurnSSE(), "plan the lookup", signedText)
+	gin.SetMode(gin.TestMode)
+
+	t.Run("buffered", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		resp := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(sse))}
+		_, err := (&GatewayService{}).handleCCBufferedFromAnthropic(resp, c, "claude-opus-5-5", "claude-opus-5-5", nil, time.Now())
+		require.NoError(t, err)
+
+		blocks := replayedAssistantBlocks(t, gjson.GetBytes(rec.Body.Bytes(), "choices.0.message").Raw)
+		require.Equal(t, signedText, blocks[0].Get("thinking").String(), "blocks: %v", blocks)
+		require.Equal(t, "sig-part-A/sig-part-B+==", blocks[0].Get("signature").String())
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		resp := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(sse))}
+		_, err := (&GatewayService{}).handleCCStreamingFromAnthropic(resp, c, "claude-opus-5-5", "claude-opus-5-5", nil, time.Now())
+		require.NoError(t, err)
+
+		details := collectChatStreamReasoningDetails(rec.Body.String())
+		require.Len(t, details, 2)
+		assistant := `{"role":"assistant","content":"checking","reasoning_details":[` + strings.Join(details, ",") + `],` +
+			`"tool_calls":[{"id":"toolu_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
+		blocks := replayedAssistantBlocks(t, assistant)
+		require.Equal(t, signedText, blocks[0].Get("thinking").String(), "blocks: %v", blocks)
+		require.Equal(t, "sig-part-A/sig-part-B+==", blocks[0].Get("signature").String())
+	})
+}
+
+// Responses are converted without reasoning_details unless the request side
+// replays them for the same model, so any other model's output stays as before.
+func TestChatReasoningDetails_NotEmittedOutsideReplayGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("buffered", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		resp := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(thinkingToolTurnSSE()))}
+		_, err := (&GatewayService{}).handleCCBufferedFromAnthropic(resp, c, "claude-sonnet-4-5", "claude-sonnet-4-5", nil, time.Now())
+		require.NoError(t, err)
+
+		require.False(t, gjson.GetBytes(rec.Body.Bytes(), "choices.0.message.reasoning_details").Exists(), "body: %s", rec.Body.String())
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		resp := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(thinkingToolTurnSSE()))}
+		_, err := (&GatewayService{}).handleCCStreamingFromAnthropic(resp, c, "claude-sonnet-4-5", "claude-sonnet-4-5", nil, time.Now())
+		require.NoError(t, err)
+
+		require.NotContains(t, rec.Body.String(), "reasoning_details")
+	})
 }
