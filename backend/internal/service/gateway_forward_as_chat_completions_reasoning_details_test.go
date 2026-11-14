@@ -384,3 +384,108 @@ func TestChatReasoningDetails_NotEmittedOutsideReplayGate(t *testing.T) {
 		require.NotContains(t, rec.Body.String(), "reasoning_details")
 	})
 }
+
+// Event and field layout of a real Anthropic stream with a signed thinking block and a tool call,
+// with placeholder values. The thinking text carries a tool name as the model sees it after tool name rewriting.
+func renamedToolTurnSSE(thinking, signature string) string {
+	data := func(event, payload string) string { return "event: " + event + "\ndata: " + payload + "\n\n" }
+	return data("message_start", `{"type":"message_start","message":{"id":"msg_stub","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`) +
+		data("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`) +
+		data("ping", `{"type":"ping"}`) +
+		data("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":`+fmt.Sprintf("%q", thinking)+`}}`) +
+		data("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":`+fmt.Sprintf("%q", signature)+`}}`) +
+		data("content_block_stop", `{"type":"content_block_stop","index":0}`) +
+		data("content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`) +
+		data("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"checking"}}`) +
+		data("content_block_stop", `{"type":"content_block_stop","index":1}`) +
+		data("content_block_start", `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_stub_1","name":"cc_ses_lookup","input":{}}}`) +
+		data("content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}`) +
+		data("content_block_stop", `{"type":"content_block_stop","index":2}`) +
+		data("message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5}}`) +
+		data("message_stop", `{"type":"message_stop"}`)
+}
+
+func assembleChatStreamMessage(t *testing.T, body string) string {
+	t.Helper()
+	var details []json.RawMessage
+	var content, reasoning, toolID, toolName, toolArgs strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		delta := gjson.Get(payload, "choices.0.delta")
+		content.WriteString(delta.Get("content").String())
+		reasoning.WriteString(delta.Get("reasoning_content").String())
+		for _, d := range delta.Get("reasoning_details").Array() {
+			details = append(details, json.RawMessage(d.Raw))
+		}
+		for _, call := range delta.Get("tool_calls").Array() {
+			toolID.WriteString(call.Get("id").String())
+			toolName.WriteString(call.Get("function.name").String())
+			toolArgs.WriteString(call.Get("function.arguments").String())
+		}
+	}
+	msg := map[string]any{
+		"role": "assistant", "content": content.String(), "reasoning_content": reasoning.String(), "reasoning_details": details,
+		"tool_calls": []any{map[string]any{"id": toolID.String(), "type": "function", "function": map[string]any{"name": toolName.String(), "arguments": toolArgs.String()}}},
+	}
+	raw, err := json.Marshal(msg)
+	require.NoError(t, err)
+	return string(raw)
+}
+
+// Two full rounds through ForwardAsChatCompletions on an OAuth account whose tool names are
+// rewritten. The thinking text of round 1 contains the rewritten tool name, which the response
+// side maps back for the client; round 2 must still send the text the upstream signed.
+func TestForwardAsChatCompletions_TwoRoundsReplaySignedThinkingWithToolNameRewrite(t *testing.T) {
+	const signedThinking = "I will call cc_ses_lookup next"
+	const signature = "sig-stub-A/B+=="
+	tools := `[{"type":"function","function":{"name":"session_lookup","description":"Look up a fact.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}]`
+	sseResponse := func(body string) *http.Response {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}
+	}
+	finalTurn := "event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_stub2","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_start\ndata: " + `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_delta\ndata: " + `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}` + "\n\n" +
+		"event: content_block_stop\ndata: " + `{"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}` + "\n\n" +
+		"event: message_stop\ndata: " + `{"type":"message_stop"}` + "\n\n"
+
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			upstream := &httpUpstreamRecorder{responses: []*http.Response{sseResponse(renamedToolTurnSSE(signedThinking, signature)), sseResponse(finalTurn)}}
+			svc := &GatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+			account := &Account{ID: 2, Platform: PlatformAnthropic, Type: AccountTypeOAuth, Concurrency: 1, Credentials: map[string]any{"access_token": "sk-test"}}
+			forward := func(body string) *httptest.ResponseRecorder {
+				rec := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(rec)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+				_, err := svc.ForwardAsChatCompletions(context.Background(), c, account, []byte(body), nil)
+				require.NoError(t, err)
+				return rec
+			}
+
+			round1 := forward(fmt.Sprintf(`{"model":"claude-haiku-5-5","stream":%v,"tools":%s,"messages":[{"role":"user","content":"look it up"}]}`, stream, tools))
+			var assistant string
+			if stream {
+				assistant = assembleChatStreamMessage(t, round1.Body.String())
+			} else {
+				assistant = gjson.GetBytes(round1.Body.Bytes(), "choices.0.message").Raw
+			}
+			require.Equal(t, "session_lookup", gjson.Get(assistant, "tool_calls.0.function.name").String(), "tool name is mapped back for the client")
+			require.NotEmpty(t, gjson.Get(assistant, "reasoning_details").Array(), "assistant: %s", assistant)
+
+			forward(fmt.Sprintf(`{"model":"claude-haiku-5-5","stream":%v,"tools":%s,"messages":[{"role":"user","content":"look it up"},%s,{"role":"tool","tool_call_id":"toolu_stub_1","content":"found"}]}`, stream, tools, assistant))
+
+			require.Len(t, upstream.bodies, 2)
+			sent := upstream.bodies[1]
+			require.Equal(t, "cc_ses_lookup", gjson.GetBytes(sent, "tools.0.name").String(), "tool name rewriting is active on the request: %s", sent)
+			thinking := gjson.GetBytes(sent, "messages.1.content.0")
+			require.Equal(t, "thinking", thinking.Get("type").String(), "content: %s", gjson.GetBytes(sent, "messages.1.content").Raw)
+			require.Equal(t, signedThinking, thinking.Get("thinking").String())
+			require.Equal(t, signature, thinking.Get("signature").String())
+		})
+	}
+}
