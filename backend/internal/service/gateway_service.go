@@ -921,8 +921,8 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		)
 	}
 
-	// 2. 提取 system 上带 cache_control: {type: "ephemeral"} 的内容。messages 带断点的请求
-	// 跳过本步，断点随轮次后移，按它取 key 会让同一对话每轮换号。
+	// 2. 提取带 cache_control: {type: "ephemeral"} 的内容。首个断点排在首条非 system 消息
+	// 之后的请求跳过本步，这类断点随轮次后移，按它取 key 会让同一对话每轮换号。
 	cacheableContent := s.extractCacheableContent(parsed)
 	if cacheableContent != "" {
 		hash := s.hashContent(cacheableContent)
@@ -1062,10 +1062,15 @@ func (s *GatewayService) extractCacheableContent(parsed *ParsedRequest) string {
 		return ""
 	}
 
-	if messagesHaveEphemeralCacheControl(parsed.MessagesRaw()) {
+	systemText := extractCacheableTextFromSystemRaw(parsed.SystemRaw())
+	messageText, afterAnchor := extractCacheableTextFromMessagesRaw(parsed.MessagesRaw())
+	if afterAnchor {
 		return ""
 	}
-	return extractCacheableTextFromSystemRaw(parsed.SystemRaw())
+	if messageText != "" {
+		return messageText
+	}
+	return systemText
 }
 
 func parseRawJSONView(raw []byte) gjson.Result {
@@ -1119,8 +1124,9 @@ func extractTextFromContentRaw(content gjson.Result) string {
 	return ""
 }
 
-// appendFirstMessageTextFromRaw 写入开头的 system/developer 消息和第一条其他消息的文本。
+// appendFirstMessageTextFromRaw 写入开头的 system/developer 消息和第一条有文本的其他消息的文本。
 // chat_completions 的 system 提示在 messages 里；只取 messages[0] 会让同一客户端的所有对话共用一个 key。
+// 没有文本的消息（纯图片、content 为 null 的 tool_calls）不作锚点，否则这类对话会塌成同一个 key。
 func appendFirstMessageTextFromRaw(builder *strings.Builder, raw []byte) {
 	if builder == nil || len(raw) == 0 {
 		return
@@ -1130,23 +1136,27 @@ func appendFirstMessageTextFromRaw(builder *strings.Builder, raw []byte) {
 		return
 	}
 	messages.ForEach(func(_, msg gjson.Result) bool {
-		switch msg.Get("role").String() {
-		case "system", "developer":
+		if isInstructionMessageRole(msg.Get("role").String()) {
 			_, _ = builder.WriteString(extractTextFromContentRaw(msg.Get("content")))
 			return true
 		}
+		before := builder.Len()
 		if content := msg.Get("content"); content.Exists() {
 			_, _ = builder.WriteString(extractTextFromContentRaw(content))
-			return false
+		} else {
+			msg.Get("parts").ForEach(func(_, part gjson.Result) bool {
+				if text := part.Get("text").String(); text != "" {
+					_, _ = builder.WriteString(text)
+				}
+				return true
+			})
 		}
-		msg.Get("parts").ForEach(func(_, part gjson.Result) bool {
-			if text := part.Get("text").String(); text != "" {
-				_, _ = builder.WriteString(text)
-			}
-			return true
-		})
-		return false
+		return builder.Len() == before
 	})
+}
+
+func isInstructionMessageRole(role string) bool {
+	return role == "system" || role == "developer"
 }
 
 func appendResponsesSessionAnchorFromRaw(builder *strings.Builder, raw []byte) {
@@ -1225,27 +1235,37 @@ func extractCacheableTextFromSystemRaw(raw []byte) string {
 	return builder.String()
 }
 
-func messagesHaveEphemeralCacheControl(raw []byte) bool {
+// extractCacheableTextFromMessagesRaw 返回第一条带 ephemeral 断点的消息的文本。
+// afterAnchor 表示该消息排在首条非 system/developer 消息之后：这样的断点随轮次后移，不能作粘性 key。
+func extractCacheableTextFromMessagesRaw(raw []byte) (text string, afterAnchor bool) {
 	messages := parseRawJSONView(raw)
 	if !messages.IsArray() {
-		return false
+		return "", false
 	}
-	found := false
+	anchorSeen := false
 	messages.ForEach(func(_, msg gjson.Result) bool {
 		content := msg.Get("content")
-		if !content.IsArray() {
-			return true
-		}
-		content.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("cache_control.type").String() == "ephemeral" {
-				found = true
+		if content.IsArray() {
+			found := false
+			content.ForEach(func(_, part gjson.Result) bool {
+				if part.Get("cache_control.type").String() == "ephemeral" {
+					found = true
+					return false
+				}
+				return true
+			})
+			if found {
+				text = extractTextFromContentRaw(content)
+				afterAnchor = anchorSeen
 				return false
 			}
-			return true
-		})
-		return !found
+		}
+		if !isInstructionMessageRole(msg.Get("role").String()) {
+			anchorSeen = true
+		}
+		return true
 	})
-	return found
+	return text, afterAnchor
 }
 
 func (s *GatewayService) hashContent(content string) string {
