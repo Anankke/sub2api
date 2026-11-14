@@ -921,7 +921,8 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		)
 	}
 
-	// 2. 提取带 cache_control: {type: "ephemeral"} 的内容
+	// 2. 提取 system 上带 cache_control: {type: "ephemeral"} 的内容。messages 带断点的请求
+	// 跳过本步，断点随轮次后移，按它取 key 会让同一对话每轮换号。
 	cacheableContent := s.extractCacheableContent(parsed)
 	if cacheableContent != "" {
 		hash := s.hashContent(cacheableContent)
@@ -932,7 +933,7 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		return hash
 	}
 
-	// 3. 最后 fallback: 使用 session上下文 + system + 所有消息的完整摘要串
+	// 3. 最后 fallback: session上下文 + system + 开头的 system/developer 消息 + 首条其他消息，同一对话各轮的锚点相同
 	var combined strings.Builder
 	// 混入请求上下文区分因子，避免不同用户相同消息产生相同 hash
 	if parsed.SessionContext != nil {
@@ -947,7 +948,7 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		_, _ = combined.WriteString(systemText)
 	}
 	contentStart := combined.Len()
-	appendMessageTextsFromRaw(&combined, parsed.MessagesRaw())
+	appendFirstMessageTextFromRaw(&combined, parsed.MessagesRaw())
 	if combined.Len() == contentStart {
 		appendResponsesSessionAnchorFromRaw(&combined, parsed.InputRaw())
 	}
@@ -1061,11 +1062,10 @@ func (s *GatewayService) extractCacheableContent(parsed *ParsedRequest) string {
 		return ""
 	}
 
-	systemText := extractCacheableTextFromSystemRaw(parsed.SystemRaw())
-	if messageText := extractCacheableTextFromMessagesRaw(parsed.MessagesRaw()); messageText != "" {
-		return messageText
+	if messagesHaveEphemeralCacheControl(parsed.MessagesRaw()) {
+		return ""
 	}
-	return systemText
+	return extractCacheableTextFromSystemRaw(parsed.SystemRaw())
 }
 
 func parseRawJSONView(raw []byte) gjson.Result {
@@ -1119,7 +1119,9 @@ func extractTextFromContentRaw(content gjson.Result) string {
 	return ""
 }
 
-func appendMessageTextsFromRaw(builder *strings.Builder, raw []byte) {
+// appendFirstMessageTextFromRaw 写入开头的 system/developer 消息和第一条其他消息的文本。
+// chat_completions 的 system 提示在 messages 里；只取 messages[0] 会让同一客户端的所有对话共用一个 key。
+func appendFirstMessageTextFromRaw(builder *strings.Builder, raw []byte) {
 	if builder == nil || len(raw) == 0 {
 		return
 	}
@@ -1128,20 +1130,22 @@ func appendMessageTextsFromRaw(builder *strings.Builder, raw []byte) {
 		return
 	}
 	messages.ForEach(func(_, msg gjson.Result) bool {
-		if content := msg.Get("content"); content.Exists() {
-			_, _ = builder.WriteString(extractTextFromContentRaw(content))
+		switch msg.Get("role").String() {
+		case "system", "developer":
+			_, _ = builder.WriteString(extractTextFromContentRaw(msg.Get("content")))
 			return true
 		}
-		parts := msg.Get("parts")
-		if parts.IsArray() {
-			parts.ForEach(func(_, part gjson.Result) bool {
-				if text := part.Get("text").String(); text != "" {
-					_, _ = builder.WriteString(text)
-				}
-				return true
-			})
+		if content := msg.Get("content"); content.Exists() {
+			_, _ = builder.WriteString(extractTextFromContentRaw(content))
+			return false
 		}
-		return true
+		msg.Get("parts").ForEach(func(_, part gjson.Result) bool {
+			if text := part.Get("text").String(); text != "" {
+				_, _ = builder.WriteString(text)
+			}
+			return true
+		})
+		return false
 	})
 }
 
@@ -1221,18 +1225,17 @@ func extractCacheableTextFromSystemRaw(raw []byte) string {
 	return builder.String()
 }
 
-func extractCacheableTextFromMessagesRaw(raw []byte) string {
+func messagesHaveEphemeralCacheControl(raw []byte) bool {
 	messages := parseRawJSONView(raw)
 	if !messages.IsArray() {
-		return ""
+		return false
 	}
-	var text string
+	found := false
 	messages.ForEach(func(_, msg gjson.Result) bool {
 		content := msg.Get("content")
 		if !content.IsArray() {
 			return true
 		}
-		found := false
 		content.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("cache_control.type").String() == "ephemeral" {
 				found = true
@@ -1240,13 +1243,9 @@ func extractCacheableTextFromMessagesRaw(raw []byte) string {
 			}
 			return true
 		})
-		if found {
-			text = extractTextFromContentRaw(content)
-			return false
-		}
-		return true
+		return !found
 	})
-	return text
+	return found
 }
 
 func (s *GatewayService) hashContent(content string) string {
